@@ -392,7 +392,32 @@ async function getYoutubeDownloadInfo(link, debugLog) {
     };
   } catch (playDlError) {
     debugLog(`play-dl failed: ${playDlError.message}`);
-    throw new Error(`Could not extract video: ${playDlError.message}`);
+  }
+
+  // Local fallback 2: Try yt-dlp to dump info!
+  try {
+    debugLog('Attempting to extract video info using yt-dlp');
+    const localPath = path.join(__dirname, '..', 'yt-dlp.exe');
+    let commandName = 'yt-dlp';
+    if (fs.existsSync(localPath)) {
+      commandName = `"${localPath}"`;
+    }
+    
+    const command = `${commandName} --dump-json --skip-download "${link}"`;
+    const { stdout } = await execPromise(command, { timeout: 40000 });
+    const info = JSON.parse(stdout);
+    
+    return {
+      mediaUrl: link, // Pass the original link, since we will download via yt-dlp anyway
+      title: info.title || 'Video',
+      raw: {
+        source: 'yt-dlp',
+        title: info.title
+      }
+    };
+  } catch (ytdlDlpError) {
+    debugLog(`yt-dlp extraction failed: ${ytdlDlpError.message}`);
+    throw new Error(`All download info extractors failed. yt-dlp error: ${ytdlDlpError.message}`);
   }
 }
 
