@@ -1,0 +1,8 @@
+node_modules/
+yt-dlp.exe
+scratch-test.js
+tmp-download-test.js
+tmp-download-test2.js
+tmp-upload-test.js
+tmp-upload-test2.js
+.env

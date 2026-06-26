@@ -4,14 +4,17 @@
   "description": "WhatsApp Webhook API for downloading and forwarding social media videos using Node.js",
   "main": "api/index.js",
   "scripts": {
-    "start": "node api/index.js",
-    "dev": "nodemon api/index.js"
+    "start": "node server.js",
+    "dev": "nodemon server.js"
   },
   "author": "Amit Das",
   "license": "MIT",
   "dependencies": {
     "axios": "^1.6.8",
-    "form-data": "^4.0.0"
+    "express": "^4.18.2",
+    "form-data": "^4.0.0",
+    "play-dl": "^1.9.7",
+    "ytdl-core": "^4.11.1"
   },
   "devDependencies": {
     "nodemon": "^3.0.3"
