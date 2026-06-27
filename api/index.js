@@ -139,27 +139,61 @@ async function uploadTempFileToFileIo(tempFilePath, debugLog) {
   throw new Error(`file.io upload failed with status ${response.status} and body ${JSON.stringify(response.data)}`);
 }
 
+// Rotating User-Agent pool to avoid fingerprinting
+const USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+];
+
+function getRandomUA() {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
+function getYtdlpCommand() {
+  // On Windows (local dev): look for yt-dlp.exe in project root
+  const winPath = path.join(__dirname, '..', 'yt-dlp.exe');
+  if (fs.existsSync(winPath)) return `"${winPath}"`;
+  // On Linux (Render / Docker): installed to /usr/local/bin/yt-dlp
+  if (fs.existsSync('/usr/local/bin/yt-dlp')) return '/usr/local/bin/yt-dlp';
+  // Fallback to global PATH
+  return 'yt-dlp';
+}
+
 async function downloadVideoWithYtdlp(videoUrl, outputPath, debugLog) {
   debugLog(`Downloading video via yt-dlp to: ${outputPath}`);
-  const localPath = path.join(__dirname, '..', 'yt-dlp.exe');
-  let commandName = 'yt-dlp';
-  if (fs.existsSync(localPath)) {
-    commandName = `"${localPath}"`;
-    debugLog(`Using local yt-dlp: ${localPath}`);
-  } else {
-    debugLog('Using global yt-dlp');
-  }
+  const cmd = getYtdlpCommand();
+  debugLog(`Using yt-dlp binary: ${cmd}`);
 
-  const command = `${commandName} -f "best[height<=720][ext=mp4]/best" -o "${outputPath}" "${videoUrl}"`;
-  
+  const ua = getRandomUA();
+  const command = [
+    cmd,
+    '-f', '"best[height<=720][ext=mp4]/bestvideo[height<=720]+bestaudio/best"',
+    '--merge-output-format', 'mp4',
+    '--no-check-certificates',
+    '--no-cache-dir',
+    '--extractor-retries', '5',
+    '--retry-sleep', 'extractor:5',
+    '--sleep-requests', '1.5',
+    '--user-agent', `"${ua}"`,
+    '--referer', '"https://www.google.com/"',
+    '-o', `"${outputPath}"`,
+    `"${videoUrl}"`
+  ].join(' ');
+
   try {
-    const { stdout, stderr } = await execPromise(command, { timeout: 120000 });
+    const { stdout, stderr } = await execPromise(command, {
+      timeout: 180000,
+      env: { ...process.env, YTDL_NO_UPDATE: '1' }
+    });
     debugLog(`yt-dlp output length: ${stdout ? stdout.length : 0}`);
     if (stderr && stderr.trim()) {
-      debugLog(`yt-dlp stderr: ${stderr.trim()}`);
+      debugLog(`yt-dlp stderr: ${stderr.substring(0, 500)}`);
     }
   } catch (err) {
-    debugLog(`yt-dlp download failed: ${err.message}`);
+    debugLog(`yt-dlp download failed: ${err.message.substring(0, 500)}`);
     throw err;
   }
 }
@@ -326,18 +360,81 @@ async function fetchRapidApiDownload(link, debugLog) {
 async function getYoutubeDownloadInfo(link, debugLog) {
   debugLog(`Fetching YouTube download info for: ${link}`);
 
+  // ============================================================
+  // STRATEGY 1 (PRIMARY): yt-dlp --dump-json with anti-bot mitigations
+  // This is the MOST reliable method on datacenter IPs.
+  // ============================================================
+  const cmd = getYtdlpCommand();
+  const maxRetries = 3;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      debugLog(`yt-dlp info extraction attempt ${attempt}/${maxRetries}`);
+      const ua = getRandomUA();
+      const command = [
+        cmd,
+        '--dump-json',
+        '--skip-download',
+        '--no-check-certificates',
+        '--no-cache-dir',
+        '--extractor-retries', '5',
+        '--retry-sleep', 'extractor:5',
+        '--sleep-requests', '1.5',
+        '--user-agent', `"${ua}"`,
+        '--referer', '"https://www.google.com/"',
+        `"${link}"`
+      ].join(' ');
+
+      const { stdout } = await execPromise(command, {
+        timeout: 60000,
+        env: { ...process.env, YTDL_NO_UPDATE: '1' }
+      });
+
+      const info = JSON.parse(stdout);
+      debugLog(`yt-dlp extracted info: title="${info.title}", duration=${info.duration}s`);
+
+      return {
+        mediaUrl: link, // Will be downloaded via yt-dlp in ensureStableMediaUrl
+        title: info.title || 'Video',
+        raw: {
+          source: 'yt-dlp',
+          title: info.title,
+          duration: info.duration,
+          uploader: info.uploader
+        }
+      };
+    } catch (ytdlpErr) {
+      const errMsg = ytdlpErr.message?.substring(0, 300) || String(ytdlpErr);
+      debugLog(`yt-dlp attempt ${attempt} failed: ${errMsg}`);
+
+      if (attempt < maxRetries) {
+        const backoffMs = attempt * 3000 + Math.random() * 2000;
+        debugLog(`Backing off ${Math.round(backoffMs)}ms before retry...`);
+        await delay(backoffMs);
+      }
+    }
+  }
+
+  // ============================================================
+  // STRATEGY 2: RapidAPI (external service, avoids our IP entirely)
+  // ============================================================
   try {
+    debugLog('Trying RapidAPI downloader...');
     return await fetchRapidApiDownload(link, debugLog);
   } catch (rapidError) {
     debugLog(`RapidAPI downloader failed: ${rapidError.message}`);
   }
 
-  // Local fallback: try ytdl-core first
+  // ============================================================
+  // STRATEGY 3 (LAST RESORT): ytdl-core / play-dl
+  // These almost always fail on datacenter IPs but cost nothing to try
+  // ============================================================
   try {
+    debugLog('Trying ytdl-core (last resort)...');
     const info = await ytdl.getInfo(link, {
       requestOptions: {
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+          'User-Agent': getRandomUA()
         }
       }
     });
@@ -359,13 +456,12 @@ async function getYoutubeDownloadInfo(link, debugLog) {
         }
       };
     }
-
-    debugLog('ytdl-core returned no usable format, falling back to play-dl');
   } catch (ytdlError) {
-    debugLog(`ytdl-core failed: ${ytdlError.message}`);
+    debugLog(`ytdl-core failed: ${ytdlError.message?.substring(0, 200)}`);
   }
 
   try {
+    debugLog('Trying play-dl (last resort)...');
     const info = await playdl.video_info(link);
     const formats = info.format || [];
     const bestFormat = formats
@@ -376,49 +472,23 @@ async function getYoutubeDownloadInfo(link, debugLog) {
         return qb - qa;
       })[0];
 
-    if (!bestFormat || !bestFormat.url) {
-      throw new Error('play-dl failed to find a valid MP4 format');
+    if (bestFormat && bestFormat.url) {
+      return {
+        mediaUrl: bestFormat.url,
+        title: info.video_details?.title || info.video_details?.name || 'Video',
+        raw: {
+          source: 'play-dl',
+          title: info.video_details?.title || info.video_details?.name,
+          quality: bestFormat.qualityLabel || bestFormat.itag,
+          mimeType: bestFormat.mimeType
+        }
+      };
     }
-
-    return {
-      mediaUrl: bestFormat.url,
-      title: info.video_details?.title || info.video_details?.name || 'Video',
-      raw: {
-        source: 'play-dl',
-        title: info.video_details?.title || info.video_details?.name,
-        quality: bestFormat.qualityLabel || bestFormat.itag,
-        mimeType: bestFormat.mimeType
-      }
-    };
   } catch (playDlError) {
-    debugLog(`play-dl failed: ${playDlError.message}`);
+    debugLog(`play-dl failed: ${playDlError.message?.substring(0, 200)}`);
   }
 
-  // Local fallback 2: Try yt-dlp to dump info!
-  try {
-    debugLog('Attempting to extract video info using yt-dlp');
-    const localPath = path.join(__dirname, '..', 'yt-dlp.exe');
-    let commandName = 'yt-dlp';
-    if (fs.existsSync(localPath)) {
-      commandName = `"${localPath}"`;
-    }
-    
-    const command = `${commandName} --dump-json --skip-download "${link}"`;
-    const { stdout } = await execPromise(command, { timeout: 40000 });
-    const info = JSON.parse(stdout);
-    
-    return {
-      mediaUrl: link, // Pass the original link, since we will download via yt-dlp anyway
-      title: info.title || 'Video',
-      raw: {
-        source: 'yt-dlp',
-        title: info.title
-      }
-    };
-  } catch (ytdlDlpError) {
-    debugLog(`yt-dlp extraction failed: ${ytdlDlpError.message}`);
-    throw new Error(`All download info extractors failed. yt-dlp error: ${ytdlDlpError.message}`);
-  }
+  throw new Error('All download info extractors failed (yt-dlp, RapidAPI, ytdl-core, play-dl)');
 }
 
 async function fetchDownloadInfo(link, debugLog) {

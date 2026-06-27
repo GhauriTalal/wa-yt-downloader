@@ -1,5 +1,8 @@
 FROM node:18-slim
 
+# Disable yt-dlp update checks (avoids 403 errors from GitHub on datacenter IPs)
+ENV YTDL_NO_UPDATE=1
+
 # Install python3, curl, and ffmpeg inside the Linux container
 RUN apt-get update && apt-get install -y python3 curl ffmpeg && rm -rf /var/lib/apt/lists/*
 
