@@ -176,9 +176,10 @@ async function downloadVideoWithYtdlp(videoUrl, outputPath, debugLog) {
     '--no-cache-dir',
     '--extractor-retries', '5',
     '--retry-sleep', 'extractor:5',
-    '--sleep-requests', '1.5',
+    '--sleep-requests', '1',
+    '--extractor-args', '"youtube:player_client=web_creator,ios,mweb"',
     '--user-agent', `"${ua}"`,
-    '--referer', '"https://www.google.com/"',
+    '--referer', '"https://www.youtube.com/"',
     '-o', `"${outputPath}"`,
     `"${videoUrl}"`
   ].join(' ');
@@ -357,15 +358,185 @@ async function fetchRapidApiDownload(link, debugLog) {
   throw new Error('RapidAPI progress polling timed out');
 }
 
+// ============================================================
+// Extract YouTube video ID from any URL format
+// ============================================================
+function extractYoutubeVideoId(url) {
+  const patterns = [
+    /(?:youtube\.com\/watch\?v=|youtube\.com\/shorts\/|youtu\.be\/)([\w-]{11})/i,
+    /[?&]v=([\w-]{11})/i
+  ];
+  for (const p of patterns) {
+    const m = url.match(p);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+// ============================================================
+// COBALT.TOOLS — External proxy API for YouTube downloads
+// Routes through cobalt's own infrastructure, NOT our IP
+// ============================================================
+async function fetchCobaltDownload(link, debugLog) {
+  debugLog('Trying cobalt.tools API...');
+
+  const cobaltInstances = [
+    'https://api.cobalt.tools',
+    'https://cobalt-api.kwiatekmiki.com',
+    'https://cobalt.canine.tools'
+  ];
+
+  for (const instance of cobaltInstances) {
+    try {
+      debugLog(`Cobalt instance: ${instance}`);
+      const response = await axios.post(`${instance}/`, {
+        url: link,
+        videoQuality: '720',
+        filenameStyle: 'basic',
+        downloadMode: 'auto'
+      }, {
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+          'User-Agent': getRandomUA()
+        },
+        timeout: 30000
+      });
+
+      const result = response.data;
+      debugLog(`Cobalt response status: ${result.status}`);
+
+      if (result.status === 'error') {
+        debugLog(`Cobalt error: ${JSON.stringify(result)}`);
+        continue;
+      }
+
+      // status can be 'redirect', 'tunnel', or 'picker'
+      if ((result.status === 'redirect' || result.status === 'tunnel') && result.url) {
+        return {
+          mediaUrl: result.url,
+          title: result.filename || 'Video',
+          raw: { source: 'cobalt', instance, status: result.status }
+        };
+      }
+
+      // picker mode - take the first video option
+      if (result.status === 'picker' && result.picker?.length > 0) {
+        const pick = result.picker.find(p => p.type === 'video') || result.picker[0];
+        if (pick.url) {
+          return {
+            mediaUrl: pick.url,
+            title: result.filename || 'Video',
+            raw: { source: 'cobalt', instance, status: 'picker' }
+          };
+        }
+      }
+
+      debugLog(`Cobalt returned unexpected structure: ${JSON.stringify(result).substring(0, 300)}`);
+    } catch (err) {
+      debugLog(`Cobalt instance ${instance} failed: ${err.message?.substring(0, 200)}`);
+    }
+  }
+
+  throw new Error('All cobalt instances failed');
+}
+
+// ============================================================
+// INVIDIOUS — Open-source YouTube frontend with public API
+// Routes through Invidious server infrastructure, NOT our IP
+// ============================================================
+async function fetchInvidiousDownload(link, debugLog) {
+  const videoId = extractYoutubeVideoId(link);
+  if (!videoId) throw new Error('Could not extract video ID for Invidious');
+
+  debugLog(`Trying Invidious API for video ID: ${videoId}`);
+
+  const instances = [
+    'https://inv.nadeko.net',
+    'https://invidious.nerdvpn.de',
+    'https://iv.ggtyler.dev',
+    'https://invidious.lunar.icu',
+    'https://yt.drgnz.club'
+  ];
+
+  for (const instance of instances) {
+    try {
+      debugLog(`Invidious instance: ${instance}`);
+      const response = await axios.get(`${instance}/api/v1/videos/${videoId}`, {
+        headers: { 'User-Agent': getRandomUA() },
+        timeout: 15000
+      });
+
+      const data = response.data;
+      const title = data.title || 'Video';
+
+      // Try formatStreams first (pre-muxed video+audio)
+      const streams = data.formatStreams || [];
+      const adaptiveFormats = data.adaptiveFormats || [];
+
+      // Find best pre-muxed MP4 stream ≤720p
+      const bestStream = streams
+        .filter(s => s.type?.includes('video/mp4') && parseInt(s.qualityLabel) <= 720)
+        .sort((a, b) => parseInt(b.qualityLabel) - parseInt(a.qualityLabel))[0];
+
+      if (bestStream?.url) {
+        debugLog(`Invidious found stream: ${bestStream.qualityLabel}`);
+        return {
+          mediaUrl: bestStream.url,
+          title,
+          raw: { source: 'invidious', instance, quality: bestStream.qualityLabel }
+        };
+      }
+
+      // Fallback to adaptive formats
+      const bestAdaptive = adaptiveFormats
+        .filter(f => f.type?.includes('video/mp4') && f.encoding === 'avc1' && parseInt(f.qualityLabel) <= 720)
+        .sort((a, b) => parseInt(b.qualityLabel) - parseInt(a.qualityLabel))[0];
+
+      if (bestAdaptive?.url) {
+        debugLog(`Invidious found adaptive format: ${bestAdaptive.qualityLabel}`);
+        return {
+          mediaUrl: bestAdaptive.url,
+          title,
+          raw: { source: 'invidious', instance, quality: bestAdaptive.qualityLabel }
+        };
+      }
+
+      debugLog(`Invidious ${instance} returned no usable formats`);
+    } catch (err) {
+      debugLog(`Invidious ${instance} failed: ${err.message?.substring(0, 200)}`);
+    }
+  }
+
+  throw new Error('All Invidious instances failed');
+}
+
 async function getYoutubeDownloadInfo(link, debugLog) {
   debugLog(`Fetching YouTube download info for: ${link}`);
 
   // ============================================================
-  // STRATEGY 1 (PRIMARY): yt-dlp --dump-json with anti-bot mitigations
-  // This is the MOST reliable method on datacenter IPs.
+  // STRATEGY 1: cobalt.tools (external proxy, bypasses our IP)
+  // ============================================================
+  try {
+    return await fetchCobaltDownload(link, debugLog);
+  } catch (cobaltErr) {
+    debugLog(`Cobalt strategy failed: ${cobaltErr.message}`);
+  }
+
+  // ============================================================
+  // STRATEGY 2: Invidious API (external proxy, bypasses our IP)
+  // ============================================================
+  try {
+    return await fetchInvidiousDownload(link, debugLog);
+  } catch (invErr) {
+    debugLog(`Invidious strategy failed: ${invErr.message}`);
+  }
+
+  // ============================================================
+  // STRATEGY 3: yt-dlp with player client rotation
   // ============================================================
   const cmd = getYtdlpCommand();
-  const maxRetries = 3;
+  const maxRetries = 2;
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
@@ -377,11 +548,12 @@ async function getYoutubeDownloadInfo(link, debugLog) {
         '--skip-download',
         '--no-check-certificates',
         '--no-cache-dir',
-        '--extractor-retries', '5',
-        '--retry-sleep', 'extractor:5',
-        '--sleep-requests', '1.5',
+        '--extractor-retries', '3',
+        '--retry-sleep', 'extractor:3',
+        '--sleep-requests', '1',
+        '--extractor-args', '"youtube:player_client=web_creator,ios,mweb"',
         '--user-agent', `"${ua}"`,
-        '--referer', '"https://www.google.com/"',
+        '--referer', '"https://www.youtube.com/"',
         `"${link}"`
       ].join(' ');
 
@@ -394,7 +566,7 @@ async function getYoutubeDownloadInfo(link, debugLog) {
       debugLog(`yt-dlp extracted info: title="${info.title}", duration=${info.duration}s`);
 
       return {
-        mediaUrl: link, // Will be downloaded via yt-dlp in ensureStableMediaUrl
+        mediaUrl: link,
         title: info.title || 'Video',
         raw: {
           source: 'yt-dlp',
@@ -416,79 +588,57 @@ async function getYoutubeDownloadInfo(link, debugLog) {
   }
 
   // ============================================================
-  // STRATEGY 2: RapidAPI (external service, avoids our IP entirely)
+  // STRATEGY 4: RapidAPI (external service)
   // ============================================================
   try {
     debugLog('Trying RapidAPI downloader...');
     return await fetchRapidApiDownload(link, debugLog);
   } catch (rapidError) {
-    debugLog(`RapidAPI downloader failed: ${rapidError.message}`);
+    debugLog(`RapidAPI failed: ${rapidError.message}`);
   }
 
   // ============================================================
-  // STRATEGY 3 (LAST RESORT): ytdl-core / play-dl
-  // These almost always fail on datacenter IPs but cost nothing to try
+  // STRATEGY 5 (LAST RESORT): ytdl-core / play-dl
   // ============================================================
   try {
     debugLog('Trying ytdl-core (last resort)...');
     const info = await ytdl.getInfo(link, {
-      requestOptions: {
-        headers: {
-          'User-Agent': getRandomUA()
-        }
-      }
+      requestOptions: { headers: { 'User-Agent': getRandomUA() } }
     });
-
     const bestFormat = ytdl.chooseFormat(info.formats, {
       quality: 'highest',
       filter: (format) => format.hasVideo && format.hasAudio && format.container === 'mp4' && format.url
     });
-
-    if (bestFormat && bestFormat.url) {
+    if (bestFormat?.url) {
       return {
         mediaUrl: bestFormat.url,
         title: info.videoDetails?.title || 'Video',
-        raw: {
-          source: 'ytdl-core',
-          title: info.videoDetails?.title,
-          quality: bestFormat.qualityLabel || bestFormat.itag,
-          mimeType: bestFormat.mimeType
-        }
+        raw: { source: 'ytdl-core', title: info.videoDetails?.title }
       };
     }
   } catch (ytdlError) {
-    debugLog(`ytdl-core failed: ${ytdlError.message?.substring(0, 200)}`);
+    debugLog(`ytdl-core failed: ${ytdlError.message?.substring(0, 150)}`);
   }
 
   try {
     debugLog('Trying play-dl (last resort)...');
     const info = await playdl.video_info(link);
     const formats = info.format || [];
-    const bestFormat = formats
-      .filter((format) => format.url && format.mimeType?.includes('mp4'))
-      .sort((a, b) => {
-        const qa = parseInt(a.qualityLabel?.replace(/[^0-9]/g, '') || a.itag || '0', 10) || 0;
-        const qb = parseInt(b.qualityLabel?.replace(/[^0-9]/g, '') || b.itag || '0', 10) || 0;
-        return qb - qa;
-      })[0];
-
-    if (bestFormat && bestFormat.url) {
+    const best = formats
+      .filter(f => f.url && f.mimeType?.includes('mp4'))
+      .sort((a, b) => parseInt(b.qualityLabel || '0') - parseInt(a.qualityLabel || '0'))[0];
+    if (best?.url) {
       return {
-        mediaUrl: bestFormat.url,
-        title: info.video_details?.title || info.video_details?.name || 'Video',
-        raw: {
-          source: 'play-dl',
-          title: info.video_details?.title || info.video_details?.name,
-          quality: bestFormat.qualityLabel || bestFormat.itag,
-          mimeType: bestFormat.mimeType
-        }
+        mediaUrl: best.url,
+        title: info.video_details?.title || 'Video',
+        raw: { source: 'play-dl', title: info.video_details?.title }
       };
     }
-  } catch (playDlError) {
-    debugLog(`play-dl failed: ${playDlError.message?.substring(0, 200)}`);
+  } catch (playDlErr) {
+    debugLog(`play-dl failed: ${playDlErr.message?.substring(0, 150)}`);
   }
 
-  throw new Error('All download info extractors failed (yt-dlp, RapidAPI, ytdl-core, play-dl)');
+  throw new Error('ALL 6 extractors failed (cobalt, invidious, yt-dlp, rapidapi, ytdl-core, play-dl)');
 }
 
 async function fetchDownloadInfo(link, debugLog) {
@@ -549,16 +699,64 @@ module.exports = async (req, res) => {
     messageText = firstMessage.message?.extendedTextMessage?.text || firstMessage.message?.conversation || '';
   } else if (event === 'received_message') {
     debugLog("Processing received_message event");
-    const bodyMessage = data.data?.message?.body_message;
-    if (!bodyMessage) {
-      debugLog("No body_message found in received_message event");
+    
+    // Deep-search the payload for message text
+    const d = data.data || {};
+    const bodyMessage = d.message?.body_message || d.data?.message?.body_message || null;
+    const rawText = 
+      bodyMessage?.content ||
+      bodyMessage?.messages?.extendedTextMessage?.text ||
+      d.data?.message?.conversation ||
+      d.data?.message?.extendedTextMessage?.text ||
+      d.body ||
+      '';
+    
+    if (!rawText) {
+      debugLog(`No message text in received_message. Payload keys: ${JSON.stringify(Object.keys(d))}`);
+      debugLog(`data.data sub-keys: ${JSON.stringify(Object.keys(d.data || {}))}`);
       return res.status(400).json({ error: "❌ Invalid received_message format." });
     }
     
-    const messageKey = data.message_key || data.data?.message_key || {};
-    remoteJid = messageKey.remoteJid || '';
-    remoteJidAlt = messageKey.remoteJidAlt || '';
-    messageText = bodyMessage.content || bodyMessage.messages?.extendedTextMessage?.text || '';
+    messageText = rawText;
+    
+    // Deep-search the payload for remoteJid (try every known location)
+    const possibleKeys = [
+      data.message_key,
+      d.message_key,
+      d.key,
+      d.data?.key,
+      d.data?.message_key,
+      d.message?.key,
+      d.data?.message?.key
+    ];
+    
+    for (const k of possibleKeys) {
+      if (k?.remoteJid) {
+        remoteJid = k.remoteJid;
+        remoteJidAlt = k.remoteJidAlt || '';
+        debugLog(`Found remoteJid at path: ${JSON.stringify(k)}`);
+        break;
+      }
+    }
+    
+    // If still no remoteJid, try sender/from/chatId fields
+    if (!remoteJid) {
+      remoteJid = d.sender || d.from || d.chatId || d.data?.sender || d.data?.from || d.data?.chatId || '';
+      if (remoteJid) debugLog(`Found remoteJid from sender/from/chatId: ${remoteJid}`);
+    }
+    
+    // Last resort: recursively search for any @s.whatsapp.net string
+    if (!remoteJid) {
+      const bodyStr = JSON.stringify(data);
+      const jidMatch = bodyStr.match(/(\d{10,15})@s\.whatsapp\.net/);
+      if (jidMatch) {
+        remoteJid = `${jidMatch[1]}@s.whatsapp.net`;
+        debugLog(`Found remoteJid via regex scan: ${remoteJid}`);
+      } else {
+        debugLog(`Could not find remoteJid anywhere in received_message payload`);
+        debugLog(`Full payload for debugging: ${JSON.stringify(data).substring(0, 1000)}`);
+      }
+    }
   }
 
   debugLog(`remoteJid: ${remoteJid}, remoteJidAlt: ${remoteJidAlt}`);
