@@ -27,24 +27,66 @@ async function downloadRemoteVideoToTemp(mediaUrl, debugLog) {
   const tempFilePath = path.join(os.tmpdir(), `wa-video-${Date.now()}-${Math.random().toString(36).slice(2)}.mp4`);
   debugLog(`Downloading remote video to temp file: ${tempFilePath}`);
 
-  const response = await axios.get(mediaUrl, {
-    responseType: 'stream',
-    timeout: 120000,
-    maxBodyLength: Infinity,
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+  const maxRetries = 3;
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      debugLog(`Download attempt ${attempt}/${maxRetries} via axios...`);
+      const response = await axios.get(mediaUrl, {
+        responseType: 'stream',
+        timeout: 120000,
+        maxBodyLength: Infinity,
+        headers: {
+          'User-Agent': getRandomUA(),
+          'Accept': 'video/mp4,video/*;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.5',
+          'Connection': 'keep-alive',
+          'Referer': 'https://youtube-info-download-api.p.rapidapi.com/'
+        }
+      });
+
+      await new Promise((resolve, reject) => {
+        const writer = fs.createWriteStream(tempFilePath);
+        response.data.pipe(writer);
+        writer.on('finish', resolve);
+        writer.on('error', reject);
+        response.data.on('error', reject);
+      });
+
+      // Check if file is completely empty
+      const stats = fs.statSync(tempFilePath);
+      if (stats.size === 0) {
+        throw new Error('Downloaded file is empty (0 bytes)');
+      }
+
+      debugLog(`Download successful via axios (${stats.size} bytes)`);
+      return tempFilePath;
+    } catch (err) {
+      lastError = err;
+      debugLog(`Download attempt ${attempt} failed: ${err.message}`);
+      
+      // Try curl fallback on last attempt if axios keeps failing
+      if (attempt === maxRetries) {
+        debugLog('Trying curl fallback as last resort...');
+        try {
+          const ua = getRandomUA();
+          await execPromise(`curl -sL -o "${tempFilePath}" -A "${ua}" -H "Accept: video/mp4,video/*" "${mediaUrl}"`, { timeout: 120000 });
+          const stats = fs.statSync(tempFilePath);
+          if (stats.size > 0) {
+            debugLog(`Download successful via curl (${stats.size} bytes)`);
+            return tempFilePath;
+          }
+        } catch (curlErr) {
+          debugLog(`curl fallback failed: ${curlErr.message}`);
+        }
+      }
+      
+      await delay(2000 * attempt); // Backoff
     }
-  });
+  }
 
-  await new Promise((resolve, reject) => {
-    const writer = fs.createWriteStream(tempFilePath);
-    response.data.pipe(writer);
-    writer.on('finish', resolve);
-    writer.on('error', reject);
-    response.data.on('error', reject);
-  });
-
-  return tempFilePath;
+  throw new Error(`Failed to download remote video after ${maxRetries} attempts. Last error: ${lastError?.message}`);
 }
 
 async function uploadTempFileToCatbox(tempFilePath, debugLog) {
