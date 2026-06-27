@@ -317,9 +317,9 @@ async function fetchRapidApiDownload(link, debugLog) {
 
   debugLog(`RapidAPI progress URL: ${data.progress_url}`);
 
-  for (let attempt = 1; attempt <= 12; attempt++) {
-    await delay(2500);
-    debugLog(`Polling RapidAPI progress (${attempt}/12)`);
+  for (let attempt = 1; attempt <= 25; attempt++) {
+    await delay(3000);
+    debugLog(`Polling RapidAPI progress (${attempt}/25)`);
 
     let progressResponse;
     try {
@@ -341,6 +341,8 @@ async function fetchRapidApiDownload(link, debugLog) {
         continue;
       }
     }
+
+    debugLog(`RapidAPI progress data: ${JSON.stringify(progressData).substring(0, 300)}`);
 
     if (progressData?.url) {
       return {
@@ -374,16 +376,16 @@ function extractYoutubeVideoId(url) {
 }
 
 // ============================================================
-// COBALT.TOOLS — External proxy API for YouTube downloads
-// Routes through cobalt's own infrastructure, NOT our IP
+// COBALT — External proxy API for YouTube downloads
 // ============================================================
 async function fetchCobaltDownload(link, debugLog) {
   debugLog('Trying cobalt.tools API...');
 
+  // Each entry: [url, requiresApiVersion]
   const cobaltInstances = [
     'https://api.cobalt.tools',
-    'https://cobalt-api.kwiatekmiki.com',
-    'https://cobalt.canine.tools'
+    'https://cobalt-api.ayo.tf',
+    'https://cobalt.api.timelessnesses.me'
   ];
 
   for (const instance of cobaltInstances) {
@@ -391,28 +393,24 @@ async function fetchCobaltDownload(link, debugLog) {
       debugLog(`Cobalt instance: ${instance}`);
       const response = await axios.post(`${instance}/`, {
         url: link,
-        videoQuality: '720',
-        filenameStyle: 'basic',
-        downloadMode: 'auto'
+        videoQuality: '720'
       }, {
         headers: {
           'Accept': 'application/json',
-          'Content-Type': 'application/json',
-          'User-Agent': getRandomUA()
+          'Content-Type': 'application/json'
         },
-        timeout: 30000
+        timeout: 20000
       });
 
       const result = response.data;
-      debugLog(`Cobalt response status: ${result.status}`);
+      debugLog(`Cobalt response: ${JSON.stringify(result).substring(0, 400)}`);
 
       if (result.status === 'error') {
-        debugLog(`Cobalt error: ${JSON.stringify(result)}`);
+        debugLog(`Cobalt error detail: ${result.error?.code || JSON.stringify(result)}`);
         continue;
       }
 
-      // status can be 'redirect', 'tunnel', or 'picker'
-      if ((result.status === 'redirect' || result.status === 'tunnel') && result.url) {
+      if ((result.status === 'redirect' || result.status === 'tunnel' || result.status === 'stream') && result.url) {
         return {
           mediaUrl: result.url,
           title: result.filename || 'Video',
@@ -420,7 +418,6 @@ async function fetchCobaltDownload(link, debugLog) {
         };
       }
 
-      // picker mode - take the first video option
       if (result.status === 'picker' && result.picker?.length > 0) {
         const pick = result.picker.find(p => p.type === 'video') || result.picker[0];
         if (pick.url) {
@@ -432,9 +429,10 @@ async function fetchCobaltDownload(link, debugLog) {
         }
       }
 
-      debugLog(`Cobalt returned unexpected structure: ${JSON.stringify(result).substring(0, 300)}`);
+      debugLog(`Cobalt returned unexpected structure`);
     } catch (err) {
-      debugLog(`Cobalt instance ${instance} failed: ${err.message?.substring(0, 200)}`);
+      const respBody = err.response?.data ? JSON.stringify(err.response.data).substring(0, 300) : 'no body';
+      debugLog(`Cobalt ${instance} failed: ${err.response?.status || err.message} | body: ${respBody}`);
     }
   }
 
@@ -442,8 +440,78 @@ async function fetchCobaltDownload(link, debugLog) {
 }
 
 // ============================================================
+// PIPED — Open-source YouTube frontend with streaming API
+// ============================================================
+async function fetchPipedDownload(link, debugLog) {
+  const videoId = extractYoutubeVideoId(link);
+  if (!videoId) throw new Error('Could not extract video ID for Piped');
+
+  debugLog(`Trying Piped API for video ID: ${videoId}`);
+
+  const instances = [
+    'https://pipedapi.kavin.rocks',
+    'https://pipedapi.adminforge.de',
+    'https://pipedapi.r4fo.com',
+    'https://pipedapi.moomoo.me',
+    'https://api.piped.projectsegfau.lt'
+  ];
+
+  for (const instance of instances) {
+    try {
+      debugLog(`Piped instance: ${instance}`);
+      const response = await axios.get(`${instance}/streams/${videoId}`, {
+        headers: { 'User-Agent': getRandomUA() },
+        timeout: 15000
+      });
+
+      const data = response.data;
+      if (data.error) {
+        debugLog(`Piped ${instance} returned error: ${data.error}`);
+        continue;
+      }
+
+      const title = data.title || 'Video';
+      const videoStreams = data.videoStreams || [];
+
+      // Try muxed streams first (videoOnly === false means it has audio)
+      const muxed = videoStreams
+        .filter(s => s.videoOnly === false && s.format === 'MPEG_4' && parseInt(s.quality) <= 720)
+        .sort((a, b) => parseInt(b.quality) - parseInt(a.quality))[0];
+
+      if (muxed?.url) {
+        debugLog(`Piped found muxed stream: ${muxed.quality}`);
+        return {
+          mediaUrl: muxed.url,
+          title,
+          raw: { source: 'piped', instance, quality: muxed.quality, muxed: true }
+        };
+      }
+
+      // Fallback to video-only stream (no audio, but at least we get video)
+      const videoOnly = videoStreams
+        .filter(s => s.format === 'MPEG_4' && parseInt(s.quality) <= 720)
+        .sort((a, b) => parseInt(b.quality) - parseInt(a.quality))[0];
+
+      if (videoOnly?.url) {
+        debugLog(`Piped found video-only stream: ${videoOnly.quality}`);
+        return {
+          mediaUrl: videoOnly.url,
+          title,
+          raw: { source: 'piped', instance, quality: videoOnly.quality, muxed: false }
+        };
+      }
+
+      debugLog(`Piped ${instance} returned no usable MP4 streams`);
+    } catch (err) {
+      debugLog(`Piped ${instance} failed: ${err.message?.substring(0, 200)}`);
+    }
+  }
+
+  throw new Error('All Piped instances failed');
+}
+
+// ============================================================
 // INVIDIOUS — Open-source YouTube frontend with public API
-// Routes through Invidious server infrastructure, NOT our IP
 // ============================================================
 async function fetchInvidiousDownload(link, debugLog) {
   const videoId = extractYoutubeVideoId(link);
@@ -452,11 +520,11 @@ async function fetchInvidiousDownload(link, debugLog) {
   debugLog(`Trying Invidious API for video ID: ${videoId}`);
 
   const instances = [
-    'https://inv.nadeko.net',
-    'https://invidious.nerdvpn.de',
-    'https://iv.ggtyler.dev',
-    'https://invidious.lunar.icu',
-    'https://yt.drgnz.club'
+    'https://vid.puffyan.us',
+    'https://invidious.fdn.fr',
+    'https://yewtu.be',
+    'https://inv.tux.pizza',
+    'https://invidious.privacyredirect.com'
   ];
 
   for (const instance of instances) {
@@ -464,17 +532,14 @@ async function fetchInvidiousDownload(link, debugLog) {
       debugLog(`Invidious instance: ${instance}`);
       const response = await axios.get(`${instance}/api/v1/videos/${videoId}`, {
         headers: { 'User-Agent': getRandomUA() },
-        timeout: 15000
+        timeout: 12000
       });
 
       const data = response.data;
       const title = data.title || 'Video';
-
-      // Try formatStreams first (pre-muxed video+audio)
       const streams = data.formatStreams || [];
       const adaptiveFormats = data.adaptiveFormats || [];
 
-      // Find best pre-muxed MP4 stream ≤720p
       const bestStream = streams
         .filter(s => s.type?.includes('video/mp4') && parseInt(s.qualityLabel) <= 720)
         .sort((a, b) => parseInt(b.qualityLabel) - parseInt(a.qualityLabel))[0];
@@ -488,13 +553,12 @@ async function fetchInvidiousDownload(link, debugLog) {
         };
       }
 
-      // Fallback to adaptive formats
       const bestAdaptive = adaptiveFormats
-        .filter(f => f.type?.includes('video/mp4') && f.encoding === 'avc1' && parseInt(f.qualityLabel) <= 720)
+        .filter(f => f.type?.includes('video/mp4') && parseInt(f.qualityLabel) <= 720)
         .sort((a, b) => parseInt(b.qualityLabel) - parseInt(a.qualityLabel))[0];
 
       if (bestAdaptive?.url) {
-        debugLog(`Invidious found adaptive format: ${bestAdaptive.qualityLabel}`);
+        debugLog(`Invidious found adaptive: ${bestAdaptive.qualityLabel}`);
         return {
           mediaUrl: bestAdaptive.url,
           title,
@@ -502,7 +566,7 @@ async function fetchInvidiousDownload(link, debugLog) {
         };
       }
 
-      debugLog(`Invidious ${instance} returned no usable formats`);
+      debugLog(`Invidious ${instance} no usable formats`);
     } catch (err) {
       debugLog(`Invidious ${instance} failed: ${err.message?.substring(0, 200)}`);
     }
@@ -515,7 +579,26 @@ async function getYoutubeDownloadInfo(link, debugLog) {
   debugLog(`Fetching YouTube download info for: ${link}`);
 
   // ============================================================
-  // STRATEGY 1: cobalt.tools (external proxy, bypasses our IP)
+  // STRATEGY 1: RapidAPI (ALMOST worked last time — just needed more polling)
+  // ============================================================
+  try {
+    debugLog('Trying RapidAPI downloader (priority)...');
+    return await fetchRapidApiDownload(link, debugLog);
+  } catch (rapidError) {
+    debugLog(`RapidAPI failed: ${rapidError.message}`);
+  }
+
+  // ============================================================
+  // STRATEGY 2: Piped API (YouTube frontend, external servers)
+  // ============================================================
+  try {
+    return await fetchPipedDownload(link, debugLog);
+  } catch (pipedErr) {
+    debugLog(`Piped strategy failed: ${pipedErr.message}`);
+  }
+
+  // ============================================================
+  // STRATEGY 3: cobalt.tools (external proxy)
   // ============================================================
   try {
     return await fetchCobaltDownload(link, debugLog);
@@ -524,7 +607,7 @@ async function getYoutubeDownloadInfo(link, debugLog) {
   }
 
   // ============================================================
-  // STRATEGY 2: Invidious API (external proxy, bypasses our IP)
+  // STRATEGY 4: Invidious API (external proxy)
   // ============================================================
   try {
     return await fetchInvidiousDownload(link, debugLog);
@@ -533,112 +616,68 @@ async function getYoutubeDownloadInfo(link, debugLog) {
   }
 
   // ============================================================
-  // STRATEGY 3: yt-dlp with player client rotation
+  // STRATEGY 5: yt-dlp with player client rotation
   // ============================================================
   const cmd = getYtdlpCommand();
-  const maxRetries = 2;
 
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      debugLog(`yt-dlp info extraction attempt ${attempt}/${maxRetries}`);
-      const ua = getRandomUA();
-      const command = [
-        cmd,
-        '--dump-json',
-        '--skip-download',
-        '--no-check-certificates',
-        '--no-cache-dir',
-        '--extractor-retries', '3',
-        '--retry-sleep', 'extractor:3',
-        '--sleep-requests', '1',
-        '--extractor-args', '"youtube:player_client=web_creator,ios,mweb"',
-        '--user-agent', `"${ua}"`,
-        '--referer', '"https://www.youtube.com/"',
-        `"${link}"`
-      ].join(' ');
-
-      const { stdout } = await execPromise(command, {
-        timeout: 60000,
-        env: { ...process.env, YTDL_NO_UPDATE: '1' }
-      });
-
-      const info = JSON.parse(stdout);
-      debugLog(`yt-dlp extracted info: title="${info.title}", duration=${info.duration}s`);
-
-      return {
-        mediaUrl: link,
-        title: info.title || 'Video',
-        raw: {
-          source: 'yt-dlp',
-          title: info.title,
-          duration: info.duration,
-          uploader: info.uploader
-        }
-      };
-    } catch (ytdlpErr) {
-      const errMsg = ytdlpErr.message?.substring(0, 300) || String(ytdlpErr);
-      debugLog(`yt-dlp attempt ${attempt} failed: ${errMsg}`);
-
-      if (attempt < maxRetries) {
-        const backoffMs = attempt * 3000 + Math.random() * 2000;
-        debugLog(`Backing off ${Math.round(backoffMs)}ms before retry...`);
-        await delay(backoffMs);
-      }
-    }
-  }
-
-  // ============================================================
-  // STRATEGY 4: RapidAPI (external service)
-  // ============================================================
   try {
-    debugLog('Trying RapidAPI downloader...');
-    return await fetchRapidApiDownload(link, debugLog);
-  } catch (rapidError) {
-    debugLog(`RapidAPI failed: ${rapidError.message}`);
-  }
+    debugLog('yt-dlp info extraction attempt...');
+    const ua = getRandomUA();
+    const command = [
+      cmd,
+      '--dump-json',
+      '--skip-download',
+      '--no-check-certificates',
+      '--no-cache-dir',
+      '--extractor-retries', '3',
+      '--retry-sleep', 'extractor:3',
+      '--sleep-requests', '1',
+      '--extractor-args', '"youtube:player_client=web_creator,ios,mweb"',
+      '--user-agent', `"${ua}"`,
+      '--referer', '"https://www.youtube.com/"',
+      `"${link}"`
+    ].join(' ');
 
-  // ============================================================
-  // STRATEGY 5 (LAST RESORT): ytdl-core / play-dl
-  // ============================================================
-  try {
-    debugLog('Trying ytdl-core (last resort)...');
-    const info = await ytdl.getInfo(link, {
-      requestOptions: { headers: { 'User-Agent': getRandomUA() } }
+    const { stdout } = await execPromise(command, {
+      timeout: 60000,
+      env: { ...process.env, YTDL_NO_UPDATE: '1' }
     });
-    const bestFormat = ytdl.chooseFormat(info.formats, {
+
+    const info = JSON.parse(stdout);
+    debugLog(`yt-dlp extracted: title="${info.title}", duration=${info.duration}s`);
+
+    return {
+      mediaUrl: link,
+      title: info.title || 'Video',
+      raw: { source: 'yt-dlp', title: info.title, duration: info.duration }
+    };
+  } catch (ytdlpErr) {
+    debugLog(`yt-dlp failed: ${ytdlpErr.message?.substring(0, 300)}`);
+  }
+
+  // ============================================================
+  // STRATEGY 6-7 (LAST RESORT): ytdl-core / play-dl
+  // ============================================================
+  try {
+    const info = await ytdl.getInfo(link, { requestOptions: { headers: { 'User-Agent': getRandomUA() } } });
+    const best = ytdl.chooseFormat(info.formats, {
       quality: 'highest',
-      filter: (format) => format.hasVideo && format.hasAudio && format.container === 'mp4' && format.url
+      filter: (f) => f.hasVideo && f.hasAudio && f.container === 'mp4' && f.url
     });
-    if (bestFormat?.url) {
-      return {
-        mediaUrl: bestFormat.url,
-        title: info.videoDetails?.title || 'Video',
-        raw: { source: 'ytdl-core', title: info.videoDetails?.title }
-      };
+    if (best?.url) {
+      return { mediaUrl: best.url, title: info.videoDetails?.title || 'Video', raw: { source: 'ytdl-core' } };
     }
-  } catch (ytdlError) {
-    debugLog(`ytdl-core failed: ${ytdlError.message?.substring(0, 150)}`);
-  }
+  } catch (e) { debugLog(`ytdl-core: ${e.message?.substring(0, 100)}`); }
 
   try {
-    debugLog('Trying play-dl (last resort)...');
     const info = await playdl.video_info(link);
-    const formats = info.format || [];
-    const best = formats
-      .filter(f => f.url && f.mimeType?.includes('mp4'))
-      .sort((a, b) => parseInt(b.qualityLabel || '0') - parseInt(a.qualityLabel || '0'))[0];
+    const best = (info.format || []).filter(f => f.url && f.mimeType?.includes('mp4')).sort((a, b) => parseInt(b.qualityLabel || '0') - parseInt(a.qualityLabel || '0'))[0];
     if (best?.url) {
-      return {
-        mediaUrl: best.url,
-        title: info.video_details?.title || 'Video',
-        raw: { source: 'play-dl', title: info.video_details?.title }
-      };
+      return { mediaUrl: best.url, title: info.video_details?.title || 'Video', raw: { source: 'play-dl' } };
     }
-  } catch (playDlErr) {
-    debugLog(`play-dl failed: ${playDlErr.message?.substring(0, 150)}`);
-  }
+  } catch (e) { debugLog(`play-dl: ${e.message?.substring(0, 100)}`); }
 
-  throw new Error('ALL 6 extractors failed (cobalt, invidious, yt-dlp, rapidapi, ytdl-core, play-dl)');
+  throw new Error('ALL 7 extractors failed (rapidapi, piped, cobalt, invidious, yt-dlp, ytdl-core, play-dl)');
 }
 
 async function fetchDownloadInfo(link, debugLog) {
