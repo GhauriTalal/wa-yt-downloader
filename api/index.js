@@ -344,9 +344,9 @@ async function fetchRapidApiDownload(link, debugLog) {
 
     debugLog(`RapidAPI progress data: ${JSON.stringify(progressData).substring(0, 300)}`);
 
-    if (progressData?.url) {
+    if (progressData?.url || progressData?.download_url) {
       return {
-        mediaUrl: progressData.url,
+        mediaUrl: progressData.url || progressData.download_url,
         title: progressData.title || title,
         raw: { source: 'rapidapi', initial: data, progress: progressData }
       };
